@@ -1,0 +1,287 @@
+import pandas as pd
+import json
+import numpy as np
+import sys
+import os
+import re
+from tqdm import tqdm
+from itertools import chain
+import importlib
+import pymysql.cursors
+import urllib.parse
+username = 'mayosandbox'
+password = 'view2sql'
+host = 'cdap-mysql-1'
+database = 'MCHS'
+import pymysql.cursors
+# Connect to the database
+connection = pymysql.connect(host=host,
+                             user=username,
+                             password=password,
+                             db=database,
+                             charset='utf8mb4',
+                             cursorclass=pymysql.cursors.DictCursor)
+
+#####
+
+def sql_query(querystring):
+    '''return a SQL query result as a list of dicts'''
+    with connection.cursor() as cursor:
+        # Read a single record
+        cursor.execute(querystring)
+        result = cursor.fetchall()
+#         print('Fetched: '+str(len(result))+' rows')
+        return result
+
+def sql_to_df(querystring):
+    '''return a dataframe with SQL query results'''
+    return pd.read_sql(querystring,con=connection)
+
+dim_med_name=sql_query('SELECT * FROM dim_med_name')
+
+#create a mapped medications dictionary
+meds_dict={item['med_name_dk']:item['med_name_description'] for item in dim_med_name}
+
+def map_med_name(med_name_dk):
+    '''return a description string for a given med_name_dk'''
+    return meds_dict[med_name_dk]
+
+def column_mapper(key,value,data,output=False):
+    '''creates a mapped dictionary for two items in a SQL results dictionary
+    key: column to serve as dict keys
+    value: column to serve as dict values
+    data: SQL results dictionary
+    ouput: filepath string for json dump'''
+    resdict= {item[key]:item[value] for item in data}
+    if output:
+        with open (output,'w+') as f:
+            json.dump(resdict,f)
+        return resdict
+    else:
+        return resdict
+
+def get_results_for_patient(table,patient_dk,fields='*',other_args=False):
+    '''return SQL query results for a select patient_dk'''
+    if other_args:
+        query='SELECT '+fields+' FROM '+table+' WHERE patient_dk='+patient_dk+' AND '+other_args
+    else:
+        query='SELECT '+fields+' FROM '+table+' WHERE patient_dk='+patient_dk
+    return sql_query(query)
+
+def get_results_for_patient_list(table,list_of_patient_dks,fields='*',other_args=False):
+    '''bulk SQL results for a list of patient_dks'''
+    if other_args:
+        return {patient_dk:get_results_for_patient(table,patient_dk,fields,other_args) for patient_dk in tqdm(list_of_patient_dks)}
+    else:
+        return {patient_dk:get_results_for_patient(table,patient_dk,fields) for patient_dk in tqdm(list_of_patient_dks)}
+
+def convert_fields_list_to_sql(fields_list):
+    '''Convert a python list or other iterator class to raw string for SQL query'''
+    return ', '.join(fields_list)
+
+def convert_patient_hkey_to_dk(hkey,map_dict):
+    '''use a mapping dict and patient hkey to map to patient_dk'''
+    return map_dict[hkey]
+
+def bulk_hkey_to_dk(hkey_list,map_dict):
+    '''bulk hkey to patient_dk converter'''
+    return [str(convert_patient_hkey_to_dk(hkey,map_dict)) for hkey in hkey_list]
+
+def find_labs(lab_test,include=False,exclude=False):
+    '''returns a json dictionary of lab_test_dks and their descriptions'''
+    res= sql_to_df('SELECT * FROM dim_lab_test_code WHERE lab_test_description LIKE "%'+lab_test+'%";')
+    res=json.loads(res[['lab_test_description','lab_test_dk']].to_json(orient='records'))
+    if include:
+        return [x for x in res if include.lower() in x['lab_test_description'].lower()]
+    if exclude:
+        return [x for x in res if exclude.lower() not in x['lab_test_description'].lower()]
+    else:
+        return res
+
+def find_orders(order,include=False,exclude=False):
+    '''returns a json dictionary of order item descriptions'''
+    res= sql_to_df('select distinct order_alias_description from fact_orders WHERE order_alias_description LIKE "%'+order+'%";')
+    res=json.loads(res[['order_alias_description']].to_json(orient='records'))
+    if include:
+        return [x for x in res if include.lower() in x['order_alias_description'].lower()]
+    if exclude:
+        return [x for x in res if exclude.lower() not in x['order_alias_description'].lower()]
+    else:
+        return res
+
+def get_lab_counts_for_cohort(cohort,labs_df):
+    '''returns a dictionary of lab descriptions and counts for each lab within a cohort'''
+    resdict={}
+    for lab_test in labs_df:
+        lab_test_dk=lab_test['lab_test_dk']
+        lab_test_description=lab_test['lab_test_description']
+        all_labs=[x for x in cohort if lab_test_dk in [i['lab_test_dk'] for i in cohort[x]]]
+        resdict[lab_test_description]={'count':len(all_labs),'patient_ids':all_labs}
+    resdict['unique_patients']=list(set(chain.from_iterable([resdict[x]['patient_ids'] for x in resdict])))
+    return resdict    
+
+def find_orders(dks,orders_list,query_term):
+    '''get all orders within a cohort for a given query term'''
+    patient_dict={k:{'match':False} for k in dks}
+    for dk in dks:
+        all_order_desc=[x['order_alias_description'] for x in orders_list[dk]]
+#         matching=any(query_term.lower() in x.lower() for x in all_order_desc)
+        matching=[x for x in all_order_desc if query_term.lower() in x.lower()]
+        print(matching)
+        if any(matching):
+            patient_dict[dk]['match']=True
+            patient_dict[dk]['matching']=matching
+        else:
+            pass
+    return patient_dict
+
+def _get_dx_codes(code):
+    return sql_query('select * from dim_diagnosis_code WHERE diagnosis_code like "'+code+'" AND diagnosis_method_code like "%ICD%" ')
+
+def get_codes_dx(code_list):
+    return list(set([x['diagnosis_code_dk'] for x in list(chain.from_iterable([_get_dx_codes(i) for i in code_list]))]))
+
+def get_dx_codes_from_desc(desc,only_codes=False):
+    res=sql_query('select * from dim_diagnosis_code WHERE diagnosis_description like "'+desc+'";')
+    if only_codes:
+        return [str(x['diagnosis_code_dk']) for x in res]
+    else:
+        return res
+
+def get_proc_codes_from_desc(desc,only_codes=False):
+    res= sql_query('select * from dim_procedure_code where procedure_description LIKE "'+desc+'";')
+    if only_codes:
+        return [str(x['procedure_code_dk']) for x in res]
+    else:
+        return res
+
+def _cvt_proc_codes(code):
+    return sql_query('select procedure_code_dk,procedure_description from dim_procedure_code where procedure_code="'+code+'"')
+
+def get_dx_for_code_list(code_list):
+    patlist=[]
+    for code in tqdm(code_list):
+        res=sql_query('select patient_dk,diagnosis_code_dk,category_code,diagnosis_dtm from fact_diagnosis where diagnosis_code_dk="'+str(code)+'"')
+        patlist.append(res)
+    return list(chain.from_iterable(patlist))
+
+def get_proc_for_code_list(code_list):
+    patlist=[]
+    for code in tqdm(code_list):
+        res=sql_query('select  patient_dk,procedure_dtm,procedure_code_dk from fact_procedures where procedure_code_dk="'+code+'"')
+        patlist.append(res)
+    return list(chain.from_iterable(patlist))
+
+def get_proc_for_code_list(code_list):
+    patlist=[]
+    for code in tqdm(code_list):
+        res=sql_query('select  patient_dk,procedure_dtm,procedure_code_dk from fact_procedures where procedure_code_dk="'+code+'"')
+        patlist.append(res)
+    return list(chain.from_iterable(patlist))
+
+def get_list_of_labs(lab_list):
+    '''pass a lab object and get all patients with the labs
+    lab object is the result of the "find_labs" query'''
+    patlist=[]
+    for lab in tqdm(lab_list):
+        dk=lab['lab_test_dk']
+        res=sql_query('select * from fact_lab_test where lab_test_dk='+str(dk)+'')
+        patlist.append(res)
+    return list(chain.from_iterable(patlist))
+
+#####
+
+g6=sql_to_df('select * from fact_lab_test where lab_test_dk = 4115')
+g6_dk=[str(x) for x in g6.patient_dk.unique()]
+g6_pats=get_results_for_patient_list('dim_patient',g6_dk,'patient_dk,encounter_epoch')
+
+#####
+
+g6_pats_df=pd.DataFrame([x[0] for x in g6_pats.values()])
+g6_pats_df.set_index('patient_dk',inplace=True)
+g6.set_index('patient_dk',inplace=True)
+g6_join=g6.join(g6_pats_df)
+g6_join['year_at_encounter']=g6_join['lab_collection_dtm']+g6_join['encounter_epoch']
+g6_join['year_at_encounter_yr']=pd.to_datetime(g6_join['year_at_encounter'],unit='s')
+g6_filtered=g6_join[(g6_join['year_at_encounter_yr']>pd.to_datetime('2017-01-01')) & (g6_join['year_at_encounter_yr']<pd.to_datetime('2019-01-01'))]
+
+#####
+
+list_ids = g6_filtered.index.to_list()
+len(list_ids)
+
+#####
+
+list_dfs = []
+name = 'select * from dim_patient where patient_dk = '
+
+for i in list_ids:
+  temp_id = str(i)
+  stitch = name + temp_id
+  temp_df = sql_to_df(stitch)
+  list_dfs.append(temp_df)
+
+final_dfs = []
+
+for i in list_dfs:
+  temp_df = i.set_index('patient_dk')
+  final_dfs.append(temp_df)
+  
+####
+
+g6_demographic = pd.concat(final_dfs)
+g6_demographic
+
+####
+
+g6_all = pd.concat([g6_filtered.reset_index(drop=False),g6_demographic.reset_index(drop=True)],axis=1)
+g6_all.set_index('patient_dk',inplace=True)
+g6_all
+
+####
+
+g6_black = g6_all.loc[g6_all['race'] == 'Black or African American']
+g6_other = g6_all.loc[g6_all['race'] != 'Black or African American']
+
+####
+
+import seaborn as sns
+import matplotlib.pyplot as plt
+
+####
+
+pd.to_numeric(g6_black.result_val)
+sns.distplot(g6_black.result_val,axlabel='lab_test_dk [4115] Result Values (U/g Hb)',kde=False,bins=50)
+
+race = ' Black or African American'
+count = str(len(g6_black))
+legend = count + race
+
+x = g6_black.result_val
+min_ylim,max_ylim = plt.ylim()
+
+plt.axvline(x.mean(),color='k',linestyle='dashed',linewidth=0.5)
+plt.text(x.mean()*1.05,max_ylim*0.8,'Mean ={:.2f}'.format(x.mean()))
+plt.text(x.mean()*1.05,max_ylim*0.73,'St. Dev. ={:.2f}'.format(x.std()))
+plt.legend([legend],loc=2)
+plt.title('(BLACK/AA) Distribution of G6PD Lab Test Values (2017-2019)')
+plt.ylabel('No. Patients')
+
+####
+
+pd.to_numeric(g6_other.result_val)
+sns.distplot(g6_other.result_val,axlabel='lab_test_dk [4115] Result Values (U/g Hb)',kde=False,bins=50)
+
+race = ' All Other'
+count = str(len(g6_other))
+legend = count + race
+
+x = g6_other.result_val
+min_ylim,max_ylim = plt.ylim()
+
+plt.axvline(x.mean(),color='k',linestyle='dashed',linewidth=0.5)
+plt.text(x.mean()*1.05,max_ylim*0.8,'Mean = {:.2f}'.format(x.mean()))
+plt.text(x.mean()*1.05,max_ylim*0.73,'St. Dev. = {:.2f}'.format(x.std()))
+plt.legend([legend])
+plt.title('(ALL OTHER) G6PD Lab Test Values (2017-2019)')
+plt.ylabel('No. Patients')
